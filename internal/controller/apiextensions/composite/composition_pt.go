@@ -32,7 +32,6 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
-	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured"
 	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured/composed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured/composite"
 
@@ -43,12 +42,12 @@ import (
 
 // Error strings.
 const (
-	errGetComposed   = "cannot get composed resource"
-	errGCComposed    = "cannot garbage collect composed resource"
-	errApplyComposed = "cannot apply composed resource"
-	errFetchDetails  = "cannot fetch connection details"
-	errInline        = "cannot inline Composition patch sets"
+	errGetComposed  = "cannot get composed resource"
+	errGCComposed   = "cannot garbage collect composed resource"
+	errFetchDetails = "cannot fetch connection details"
+	errInline       = "cannot inline Composition patch sets"
 
+	errFmtApplyComposed              = "cannot apply composed resource %q"
 	errFmtPatchEnvironment           = "cannot apply environment patch at index %d"
 	errFmtParseBase                  = "cannot parse base template of composed resource %q"
 	errFmtRenderFromCompositePatches = "cannot render FromComposite or environment patches for composed resource %q"
@@ -126,10 +125,6 @@ type PTComposer struct {
 // NewPTComposer returns a Composer that composes resources using Patch and
 // Transform (P&T) Composition - a Composition's bases, patches, and transforms.
 func NewPTComposer(kube client.Client, o ...PTComposerOption) *PTComposer {
-	// TODO(negz): Can we avoid double-wrapping if the supplied client is
-	// already wrapped? Or just do away with unstructured.NewClient completely?
-	kube = unstructured.NewClient(kube)
-
 	c := &PTComposer{
 		client: resource.ClientApplicator{Client: kube, Applicator: resource.NewAPIPatchingApplicator(kube)},
 
@@ -279,7 +274,7 @@ func (c *PTComposer) Compose(ctx context.Context, xr *composite.Unstructured, re
 				// run again the composition after some other resource is
 				// created or updated successfully. So, we emit a warning event
 				// and move on.
-				events = append(events, event.Warning(reasonCompose, errors.Wrap(err, errApplyComposed)))
+				events = append(events, event.Warning(reasonCompose, errors.Wrapf(err, errFmtApplyComposed, ptr.Deref(t.Name, fmt.Sprintf("%d", i+1)))))
 				// We unset the cd here so that we don't try to observe it
 				// later. This will also mean we report it as not ready and not
 				// synced. Resulting in the XR being reported as not ready nor
@@ -291,7 +286,7 @@ func (c *PTComposer) Compose(ctx context.Context, xr *composite.Unstructured, re
 			// TODO(negz): Include the template name (if any) in this error.
 			// Including the rendered resource's kind may help too (e.g. if the
 			// template is anonymous).
-			return CompositionResult{}, errors.Wrap(err, errApplyComposed)
+			return CompositionResult{}, errors.Wrapf(err, errFmtApplyComposed, ptr.Deref(t.Name, fmt.Sprintf("%d", i+1)))
 		}
 	}
 
@@ -416,7 +411,7 @@ func AssociateByOrder(t []v1.ComposedTemplate, r []corev1.ObjectReference) []Tem
 		j = len(r)
 	}
 
-	for i := 0; i < j; i++ {
+	for i := range j {
 		a[i].Reference = r[i]
 	}
 
