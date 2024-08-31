@@ -32,7 +32,6 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
-	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured"
 	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured/composed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured/composite"
 
@@ -43,12 +42,12 @@ import (
 
 // Error strings.
 const (
-	errGetComposed   = "cannot get composed resource"
-	errGCComposed    = "cannot garbage collect composed resource"
-	errApplyComposed = "cannot apply composed resource"
-	errFetchDetails  = "cannot fetch connection details"
-	errInline        = "cannot inline Composition patch sets"
+	errGetComposed  = "cannot get composed resource"
+	errGCComposed   = "cannot garbage collect composed resource"
+	errFetchDetails = "cannot fetch connection details"
+	errInline       = "cannot inline Composition patch sets"
 
+	errFmtApplyComposed              = "cannot apply composed resource %q"
 	errFmtPatchEnvironment           = "cannot apply environment patch at index %d"
 	errFmtParseBase                  = "cannot parse base template of composed resource %q"
 	errFmtRenderFromCompositePatches = "cannot render FromComposite or environment patches for composed resource %q"
@@ -126,10 +125,6 @@ type PTComposer struct {
 // NewPTComposer returns a Composer that composes resources using Patch and
 // Transform (P&T) Composition - a Composition's bases, patches, and transforms.
 func NewPTComposer(kube client.Client, o ...PTComposerOption) *PTComposer {
-	// TODO(negz): Can we avoid double-wrapping if the supplied client is
-	// already wrapped? Or just do away with unstructured.NewClient completely?
-	kube = unstructured.NewClient(kube)
-
 	c := &PTComposer{
 		client: resource.ClientApplicator{Client: kube, Applicator: resource.NewAPIPatchingApplicator(kube)},
 
@@ -188,7 +183,7 @@ func (c *PTComposer) Compose(ctx context.Context, xr *composite.Unstructured, re
 		}
 	}
 
-	events := make([]event.Event, 0)
+	events := make([]TargetedEvent, 0)
 
 	// We optimistically render all composed resources that we are able to with
 	// the expectation that any that we fail to render will subsequently have
@@ -218,17 +213,26 @@ func (c *PTComposer) Compose(ctx context.Context, xr *composite.Unstructured, re
 
 		rendered := true
 		if err := RenderFromCompositeAndEnvironmentPatches(r, xr, req.Environment, ta.Template.Patches); err != nil {
-			events = append(events, event.Warning(reasonCompose, errors.Wrapf(err, errFmtRenderFromCompositePatches, name)))
+			events = append(events, TargetedEvent{
+				Event:  event.Warning(reasonCompose, errors.Wrapf(err, errFmtRenderFromCompositePatches, name)),
+				Target: CompositionTargetComposite,
+			})
 			rendered = false
 		}
 
 		if err := RenderComposedResourceMetadata(r, xr, ResourceName(ptr.Deref(ta.Template.Name, ""))); err != nil {
-			events = append(events, event.Warning(reasonCompose, errors.Wrapf(err, errFmtRenderMetadata, name)))
+			events = append(events, TargetedEvent{
+				Event:  event.Warning(reasonCompose, errors.Wrapf(err, errFmtRenderMetadata, name)),
+				Target: CompositionTargetComposite,
+			})
 			rendered = false
 		}
 
 		if err := c.composed.GenerateName(ctx, r); err != nil {
-			events = append(events, event.Warning(reasonCompose, errors.Wrapf(err, errFmtGenerateName, name)))
+			events = append(events, TargetedEvent{
+				Event:  event.Warning(reasonCompose, errors.Wrapf(err, errFmtGenerateName, name)),
+				Target: CompositionTargetComposite,
+			})
 			rendered = false
 		}
 
@@ -279,7 +283,10 @@ func (c *PTComposer) Compose(ctx context.Context, xr *composite.Unstructured, re
 				// run again the composition after some other resource is
 				// created or updated successfully. So, we emit a warning event
 				// and move on.
-				events = append(events, event.Warning(reasonCompose, errors.Wrap(err, errApplyComposed)))
+				events = append(events, TargetedEvent{
+					Event:  event.Warning(reasonCompose, errors.Wrapf(err, errFmtApplyComposed, ptr.Deref(t.Name, fmt.Sprintf("%d", i+1)))),
+					Target: CompositionTargetComposite,
+				})
 				// We unset the cd here so that we don't try to observe it
 				// later. This will also mean we report it as not ready and not
 				// synced. Resulting in the XR being reported as not ready nor
@@ -291,7 +298,7 @@ func (c *PTComposer) Compose(ctx context.Context, xr *composite.Unstructured, re
 			// TODO(negz): Include the template name (if any) in this error.
 			// Including the rendered resource's kind may help too (e.g. if the
 			// template is anonymous).
-			return CompositionResult{}, errors.Wrap(err, errApplyComposed)
+			return CompositionResult{}, errors.Wrapf(err, errFmtApplyComposed, ptr.Deref(t.Name, fmt.Sprintf("%d", i+1)))
 		}
 	}
 
@@ -416,7 +423,7 @@ func AssociateByOrder(t []v1.ComposedTemplate, r []corev1.ObjectReference) []Tem
 		j = len(r)
 	}
 
-	for i := 0; i < j; i++ {
+	for i := range j {
 		a[i].Reference = r[i]
 	}
 
@@ -509,9 +516,17 @@ func (a *GarbageCollectingAssociator) AssociateTemplates(ctx context.Context, cr
 			continue
 		}
 
-		// We want to garbage collect this resource, but we don't control it.
-		if c := metav1.GetControllerOf(cd); c == nil || c.UID != cr.GetUID() {
-			continue
+		// Don't garbage collect composed resources that someone else controls.
+		//
+		// We do garbage collect composed resources that no-one controls. If a
+		// composed resource appears in observed (i.e. appears in the XR's
+		// spec.resourceRefs) but doesn't have a controller ref, most likely we
+		// created it but its controller ref was stripped. In this situation it
+		// would be permissible for us to adopt the composed resource by setting
+		// our XR as the controller ref, then delete it. So we may as well just
+		// go straight to deleting it.
+		if c := metav1.GetControllerOf(cd); c != nil && c.UID != cr.GetUID() {
+			return nil, errors.Errorf(errFmtControllerMismatch, name, c.Kind, c.Name)
 		}
 
 		// This existing resource does not correspond to an extant template. It

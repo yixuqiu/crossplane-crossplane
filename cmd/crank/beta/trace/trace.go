@@ -69,6 +69,7 @@ type Cmd struct {
 	ShowPackageDependencies   string `default:"unique"                              enum:"unique,all,none"                             help:"Show package dependencies in the output. One of: unique, all, none." name:"show-package-dependencies"`
 	ShowPackageRevisions      string `default:"active"                              enum:"active,all,none"                             help:"Show package revisions in the output. One of: active, all, none."    name:"show-package-revisions"`
 	ShowPackageRuntimeConfigs bool   `default:"false"                               help:"Show package runtime configs in the output." name:"show-package-runtime-configs"`
+	Concurrency               int    `default:"5"                                   help:"load concurrency"                            name:"concurrency"`
 }
 
 // Help returns help message for the trace command.
@@ -124,6 +125,19 @@ func (c *Cmd) Run(k *kong.Context, logger logging.Logger) error {
 	if err != nil {
 		return errors.Wrap(err, errKubeConfig)
 	}
+
+	// NOTE(phisco): We used to get them set as part of
+	// https://github.com/kubernetes-sigs/controller-runtime/blob/2e9781e9fc6054387cf0901c70db56f0b0a63083/pkg/client/config/config.go#L96,
+	// this new approach doesn't set them, so we need to set them here to avoid
+	// being utterly slow.
+	// TODO(phisco): make this configurable.
+	if kubeconfig.QPS == 0 {
+		kubeconfig.QPS = 20
+	}
+	if kubeconfig.Burst == 0 {
+		kubeconfig.Burst = 30
+	}
+
 	logger.Debug("Found kubeconfig")
 
 	client, err := client.New(kubeconfig, client.Options{
@@ -195,7 +209,10 @@ func (c *Cmd) Run(k *kong.Context, logger logging.Logger) error {
 		}
 	default:
 		logger.Debug("Requested resource is not a package, assumed to be an XR, XRC or MR")
-		treeClient, err = xrm.NewClient(client, xrm.WithConnectionSecrets(c.ShowConnectionSecrets))
+		treeClient, err = xrm.NewClient(client,
+			xrm.WithConnectionSecrets(c.ShowConnectionSecrets),
+			xrm.WithConcurrency(c.Concurrency),
+		)
 		if err != nil {
 			return errors.Wrap(err, errInitKubeClient)
 		}

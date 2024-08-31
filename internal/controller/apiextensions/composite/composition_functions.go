@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 
@@ -34,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/json"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
@@ -43,7 +43,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured/composed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource/unstructured/composite"
 
-	"github.com/crossplane/crossplane/apis/apiextensions/fn/proto/v1beta1"
+	fnv1 "github.com/crossplane/crossplane/apis/apiextensions/fn/proto/v1"
 	v1 "github.com/crossplane/crossplane/apis/apiextensions/v1"
 	"github.com/crossplane/crossplane/internal/names"
 )
@@ -72,11 +72,11 @@ const (
 	errFmtUnmarshalPipelineStepInput = "cannot unmarshal input for Composition pipeline step %q"
 	errFmtGetCredentialsFromSecret   = "cannot get Composition pipeline step %q credential %q from Secret"
 	errFmtRunPipelineStep            = "cannot run Composition pipeline step %q"
+	errFmtControllerMismatch         = "refusing to delete composed resource %q that is controlled by %s %q"
 	errFmtDeleteCD                   = "cannot delete composed resource %q (a %s named %s)"
 	errFmtUnmarshalDesiredCD         = "cannot unmarshal desired composed resource %q from RunFunctionResponse"
 	errFmtCDAsStruct                 = "cannot encode composed resource %q to protocol buffer Struct well-known type"
 	errFmtFatalResult                = "pipeline step %q returned a fatal result: %s"
-	errFmtFunctionMaxIterations      = "step %q requirements didn't stabilize after the maximum number of iterations (%d)"
 )
 
 // Server-side-apply field owners. We need two of these because it's possible
@@ -102,13 +102,6 @@ const (
 	FunctionContextKeyEnvironment = "apiextensions.crossplane.io/environment"
 )
 
-const (
-	// MaxRequirementsIterations is the maximum number of times a Function should be called,
-	// limiting the number of times it can request for extra resources, capped for
-	// safety.
-	MaxRequirementsIterations = 5
-)
-
 // A FunctionComposer supports composing resources using a pipeline of
 // Composition Functions. It ignores the P&T resources array.
 type FunctionComposer struct {
@@ -129,14 +122,14 @@ type xr struct {
 // A FunctionRunner runs a single Composition Function.
 type FunctionRunner interface {
 	// RunFunction runs the named Composition Function.
-	RunFunction(ctx context.Context, name string, req *v1beta1.RunFunctionRequest) (*v1beta1.RunFunctionResponse, error)
+	RunFunction(ctx context.Context, name string, req *fnv1.RunFunctionRequest) (*fnv1.RunFunctionResponse, error)
 }
 
 // A FunctionRunnerFn is a function that can run a Composition Function.
-type FunctionRunnerFn func(ctx context.Context, name string, req *v1beta1.RunFunctionRequest) (*v1beta1.RunFunctionResponse, error)
+type FunctionRunnerFn func(ctx context.Context, name string, req *fnv1.RunFunctionRequest) (*fnv1.RunFunctionResponse, error)
 
 // RunFunction runs the named Composition Function with the supplied request.
-func (fn FunctionRunnerFn) RunFunction(ctx context.Context, name string, req *v1beta1.RunFunctionRequest) (*v1beta1.RunFunctionResponse, error) {
+func (fn FunctionRunnerFn) RunFunction(ctx context.Context, name string, req *fnv1.RunFunctionRequest) (*fnv1.RunFunctionResponse, error) {
 	return fn(ctx, name, req)
 }
 
@@ -155,14 +148,14 @@ func (fn ComposedResourceObserverFn) ObserveComposedResources(ctx context.Contex
 
 // A ExtraResourcesFetcher gets extra resources matching a selector.
 type ExtraResourcesFetcher interface {
-	Fetch(ctx context.Context, rs *v1beta1.ResourceSelector) (*v1beta1.Resources, error)
+	Fetch(ctx context.Context, rs *fnv1.ResourceSelector) (*fnv1.Resources, error)
 }
 
 // An ExtraResourcesFetcherFn gets extra resources matching the selector.
-type ExtraResourcesFetcherFn func(ctx context.Context, rs *v1beta1.ResourceSelector) (*v1beta1.Resources, error)
+type ExtraResourcesFetcherFn func(ctx context.Context, rs *fnv1.ResourceSelector) (*fnv1.Resources, error)
 
 // Fetch gets extra resources matching the selector.
-func (fn ExtraResourcesFetcherFn) Fetch(ctx context.Context, rs *v1beta1.ResourceSelector) (*v1beta1.Resources, error) {
+func (fn ExtraResourcesFetcherFn) Fetch(ctx context.Context, rs *fnv1.ResourceSelector) (*fnv1.Resources, error) {
 	return fn(ctx, rs)
 }
 
@@ -209,14 +202,6 @@ func WithComposedResourceObserver(g ComposedResourceObserver) FunctionComposerOp
 	}
 }
 
-// WithExtraResourcesFetcher configures how the FunctionComposer should fetch extra
-// resources requested by functions.
-func WithExtraResourcesFetcher(f ExtraResourcesFetcher) FunctionComposerOption {
-	return func(p *FunctionComposer) {
-		p.composite.ExtraResourcesFetcher = f
-	}
-}
-
 // WithComposedResourceGarbageCollector configures how the FunctionComposer should
 // garbage collect undesired composed resources.
 func WithComposedResourceGarbageCollector(d ComposedResourceGarbageCollector) FunctionComposerOption {
@@ -237,10 +222,6 @@ func WithManagedFieldsUpgrader(u ManagedFieldsUpgrader) FunctionComposerOption {
 // NewFunctionComposer returns a new Composer that supports composing resources using
 // both Patch and Transform (P&T) logic and a pipeline of Composition Functions.
 func NewFunctionComposer(kube client.Client, r FunctionRunner, o ...FunctionComposerOption) *FunctionComposer {
-	// TODO(negz): Can we avoid double-wrapping if the supplied client is
-	// already wrapped? Or just do away with unstructured.NewClient completely?
-	kube = unstructured.NewClient(kube)
-
 	f := NewSecretConnectionDetailsFetcher(kube)
 
 	c := &FunctionComposer{
@@ -293,9 +274,10 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 	}
 
 	// The Function pipeline starts with empty desired state.
-	d := &v1beta1.State{}
+	d := &fnv1.State{}
 
-	events := []event.Event{}
+	events := []TargetedEvent{}
+	conditions := []TargetedCondition{}
 
 	// The Function context starts empty...
 	fctx := &structpb.Struct{Fields: map[string]*structpb.Value{}}
@@ -313,7 +295,7 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 	// the desired state returned by the last, and each Function may produce
 	// results that will be emitted as events.
 	for _, fn := range req.Revision.Spec.Pipeline {
-		req := &v1beta1.RunFunctionRequest{Observed: o, Desired: d, Context: fctx}
+		req := &fnv1.RunFunctionRequest{Observed: o, Desired: d, Context: fctx}
 
 		if fn.Input != nil {
 			in := &structpb.Struct{}
@@ -323,7 +305,7 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 			req.Input = in
 		}
 
-		req.Credentials = map[string]*v1beta1.Credentials{}
+		req.Credentials = map[string]*fnv1.Credentials{}
 		for _, cs := range fn.Credentials {
 			// For now we only support loading credentials from secrets.
 			if cs.Source != v1.FunctionCredentialsSourceSecret || cs.SecretRef == nil {
@@ -334,64 +316,20 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 			if err := c.client.Get(ctx, client.ObjectKey{Namespace: cs.SecretRef.Namespace, Name: cs.SecretRef.Name}, s); err != nil {
 				return CompositionResult{}, errors.Wrapf(err, errFmtGetCredentialsFromSecret, fn.Step, cs.Name)
 			}
-			req.Credentials[cs.Name] = &v1beta1.Credentials{
-				Source: &v1beta1.Credentials_CredentialData{
-					CredentialData: &v1beta1.CredentialData{
+			req.Credentials[cs.Name] = &fnv1.Credentials{
+				Source: &fnv1.Credentials_CredentialData{
+					CredentialData: &fnv1.CredentialData{
 						Data: s.Data,
 					},
 				},
 			}
 		}
 
-		// Used to store the requirements returned at the previous iteration.
-		var requirements *v1beta1.Requirements
-		// Used to store the response of the function at the previous iteration.
-		var rsp *v1beta1.RunFunctionResponse
-
-		for i := int64(0); i <= MaxRequirementsIterations; i++ {
-			if i == MaxRequirementsIterations {
-				// The requirements didn't stabilize after the maximum number of iterations.
-				return CompositionResult{}, errors.Errorf(errFmtFunctionMaxIterations, fn.Step, MaxRequirementsIterations)
-			}
-
-			// TODO(negz): Generate a content-addressable tag for this request.
-			// Perhaps using https://github.com/cerbos/protoc-gen-go-hashpb ?
-			rsp, err = c.pipeline.RunFunction(ctx, fn.FunctionRef.Name, req)
-			if err != nil {
-				return CompositionResult{}, errors.Wrapf(err, errFmtRunPipelineStep, fn.Step)
-			}
-
-			if c.composite.ExtraResourcesFetcher == nil {
-				// If we don't have an extra resources getter, we don't need to
-				// iterate to satisfy the requirements.
-				break
-			}
-
-			newRequirements := rsp.GetRequirements()
-			if reflect.DeepEqual(newRequirements, requirements) {
-				// The requirements stabilized, the function is done.
-				break
-			}
-
-			// Store the requirements for the next iteration.
-			requirements = newRequirements
-
-			// Cleanup the extra resources from the previous iteration to store the new ones
-			req.ExtraResources = make(map[string]*v1beta1.Resources)
-
-			// Fetch the requested resources and add them to the desired state.
-			for name, selector := range newRequirements.GetExtraResources() {
-				resources, err := c.composite.ExtraResourcesFetcher.Fetch(ctx, selector)
-				if err != nil {
-					return CompositionResult{}, errors.Wrapf(err, "fetching resources for %s", name)
-				}
-
-				// Resources would be nil in case of not found resources.
-				req.ExtraResources[name] = resources
-			}
-
-			// Pass down the updated context across iterations.
-			req.Context = rsp.GetContext()
+		// TODO(negz): Generate a content-addressable tag for this request.
+		// Perhaps using https://github.com/cerbos/protoc-gen-go-hashpb ?
+		rsp, err := c.pipeline.RunFunction(ctx, fn.FunctionRef.Name, req)
+		if err != nil {
+			return CompositionResult{}, errors.Wrapf(err, errFmtRunPipelineStep, fn.Step)
 		}
 
 		// Pass the desired state returned by this Function to the next one.
@@ -401,22 +339,58 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 		// We intentionally discard/ignore this after the last Function runs.
 		fctx = rsp.GetContext()
 
+		for _, c := range rsp.GetConditions() {
+			var status corev1.ConditionStatus
+			switch c.GetStatus() {
+			case fnv1.Status_STATUS_CONDITION_TRUE:
+				status = corev1.ConditionTrue
+			case fnv1.Status_STATUS_CONDITION_FALSE:
+				status = corev1.ConditionFalse
+			case fnv1.Status_STATUS_CONDITION_UNKNOWN, fnv1.Status_STATUS_CONDITION_UNSPECIFIED:
+				status = corev1.ConditionUnknown
+			}
+
+			conditions = append(conditions, TargetedCondition{
+				Condition: xpv1.Condition{
+					Type:               xpv1.ConditionType(c.GetType()),
+					Status:             status,
+					LastTransitionTime: metav1.Now(),
+					Reason:             xpv1.ConditionReason(c.GetReason()),
+					Message:            c.GetMessage(),
+				},
+				Target: convertTarget(c.GetTarget()),
+			})
+		}
+
 		// Results of fatal severity stop the Composition process. Other results
 		// are accumulated to be emitted as events by the Reconciler.
 		for _, rs := range rsp.GetResults() {
+			reason := event.Reason(rs.GetReason())
+			if reason == "" {
+				reason = reasonCompose
+			}
+
+			e := TargetedEvent{Target: convertTarget(rs.GetTarget())}
+
 			switch rs.GetSeverity() {
-			case v1beta1.Severity_SEVERITY_FATAL:
-				return CompositionResult{}, errors.Errorf(errFmtFatalResult, fn.Step, rs.GetMessage())
-			case v1beta1.Severity_SEVERITY_WARNING:
-				events = append(events, event.Warning(reasonCompose, errors.Errorf("Pipeline step %q: %s", fn.Step, rs.GetMessage())))
-			case v1beta1.Severity_SEVERITY_NORMAL:
-				events = append(events, event.Normal(reasonCompose, fmt.Sprintf("Pipeline step %q: %s", fn.Step, rs.GetMessage())))
-			case v1beta1.Severity_SEVERITY_UNSPECIFIED:
+			case fnv1.Severity_SEVERITY_FATAL:
+				return CompositionResult{Events: events, Conditions: conditions}, errors.Errorf(errFmtFatalResult, fn.Step, rs.GetMessage())
+			case fnv1.Severity_SEVERITY_WARNING:
+				e.Event = event.Warning(reason, errors.New(rs.GetMessage()))
+				e.Detail = fmt.Sprintf("Pipeline step %q", fn.Step)
+			case fnv1.Severity_SEVERITY_NORMAL:
+				e.Event = event.Normal(reason, rs.GetMessage())
+				e.Detail = fmt.Sprintf("Pipeline step %q", fn.Step)
+			case fnv1.Severity_SEVERITY_UNSPECIFIED:
 				// We could hit this case if a Function was built against a newer
 				// protobuf than this build of Crossplane, and the new protobuf
 				// introduced a severity that we don't know about.
-				events = append(events, event.Warning(reasonCompose, errors.Errorf("Pipeline step %q returned a result of unknown severity (assuming warning): %s", fn.Step, rs.GetMessage())))
+				e.Event = event.Warning(reason, errors.Errorf("Pipeline step %q returned a result of unknown severity (assuming warning): %s", fn.Step, rs.GetMessage()))
+				// Explicitly target only the XR, since we're including information
+				// about an exceptional, unexpected state.
+				e.Target = CompositionTargetComposite
 			}
+			events = append(events, e)
 		}
 	}
 
@@ -461,7 +435,7 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 		desired[ResourceName(name)] = ComposedResourceState{
 			Resource:          cd,
 			ConnectionDetails: dr.GetConnectionDetails(),
-			Ready:             dr.GetReady() == v1beta1.Ready_READY_TRUE,
+			Ready:             dr.GetReady() == fnv1.Ready_READY_TRUE,
 		}
 	}
 
@@ -535,7 +509,10 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 				// We mark the resource as not synced, so that once we get to
 				// decide the XR's Synced condition, we can set it to false if
 				// any of the resources didn't sync successfully.
-				events = append(events, event.Warning(reasonCompose, errors.Wrapf(err, errFmtApplyCD, name)))
+				events = append(events, TargetedEvent{
+					Event:  event.Warning(reasonCompose, errors.Wrapf(err, errFmtApplyCD, name)),
+					Target: CompositionTargetComposite,
+				})
 				// NOTE(phisco): here we behave differently w.r.t. the native
 				// p&t composer, as we respect the readiness reported by
 				// functions, while there we defaulted to also set ready false
@@ -576,7 +553,7 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 		return CompositionResult{}, errors.Wrap(err, errApplyXRStatus)
 	}
 
-	return CompositionResult{ConnectionDetails: d.GetComposite().GetConnectionDetails(), Composed: resources, Events: events}, nil
+	return CompositionResult{ConnectionDetails: d.GetComposite().GetConnectionDetails(), Composed: resources, Events: events, Conditions: conditions}, nil
 }
 
 // ComposedFieldOwnerName generates a unique field owner name
@@ -600,68 +577,6 @@ func ComposedFieldOwnerName(xr *composite.Unstructured) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(xr.GetName() + xr.GroupVersionKind().GroupKind().String()))
 	return fmt.Sprintf("%s/%x", FieldOwnerComposedPrefix, h.Sum(nil))
-}
-
-// ExistingExtraResourcesFetcher fetches extra resources requested by
-// functions using the provided client.Reader.
-type ExistingExtraResourcesFetcher struct {
-	client client.Reader
-}
-
-// NewExistingExtraResourcesFetcher returns a new ExistingExtraResourcesFetcher.
-func NewExistingExtraResourcesFetcher(c client.Reader) *ExistingExtraResourcesFetcher {
-	return &ExistingExtraResourcesFetcher{client: c}
-}
-
-// Fetch fetches resources requested by functions using the provided client.Reader.
-func (e *ExistingExtraResourcesFetcher) Fetch(ctx context.Context, rs *v1beta1.ResourceSelector) (*v1beta1.Resources, error) {
-	if rs == nil {
-		return nil, errors.New(errNilResourceSelector)
-	}
-	switch match := rs.GetMatch().(type) {
-	case *v1beta1.ResourceSelector_MatchName:
-		// Fetch a single resource.
-		r := &kunstructured.Unstructured{}
-		r.SetAPIVersion(rs.GetApiVersion())
-		r.SetKind(rs.GetKind())
-		nn := types.NamespacedName{Name: rs.GetMatchName()}
-		err := e.client.Get(ctx, nn, r)
-		if kerrors.IsNotFound(err) {
-			// The resource doesn't exist. We'll return nil, which the Functions
-			// know means that the resource was not found.
-			return nil, nil
-		}
-		if err != nil {
-			return nil, errors.Wrap(err, errGetExtraResourceByName)
-		}
-		o, err := AsStruct(r)
-		if err != nil {
-			return nil, errors.Wrap(err, errExtraResourceAsStruct)
-		}
-		return &v1beta1.Resources{Items: []*v1beta1.Resource{{Resource: o}}}, nil
-	case *v1beta1.ResourceSelector_MatchLabels:
-		// Fetch a list of resources.
-		list := &kunstructured.UnstructuredList{}
-		list.SetAPIVersion(rs.GetApiVersion())
-		list.SetKind(rs.GetKind())
-
-		if err := e.client.List(ctx, list, client.MatchingLabels(match.MatchLabels.GetLabels())); err != nil {
-			return nil, errors.Wrap(err, errListExtraResources)
-		}
-
-		resources := make([]*v1beta1.Resource, len(list.Items))
-		for i, r := range list.Items {
-			r := r
-			o, err := AsStruct(&r)
-			if err != nil {
-				return nil, errors.Wrap(err, errExtraResourceAsStruct)
-			}
-			resources[i] = &v1beta1.Resource{Resource: o}
-		}
-
-		return &v1beta1.Resources{Items: resources}, nil
-	}
-	return nil, errors.New(errUnknownResourceSelector)
 }
 
 // An ExistingComposedResourceObserver uses an XR's resource references to load
@@ -735,25 +650,25 @@ func (g *ExistingComposedResourceObserver) ObserveComposedResources(ctx context.
 
 // AsState builds state for a RunFunctionRequest from the XR and composed
 // resources.
-func AsState(xr resource.Composite, xc managed.ConnectionDetails, rs ComposedResourceStates) (*v1beta1.State, error) {
+func AsState(xr resource.Composite, xc managed.ConnectionDetails, rs ComposedResourceStates) (*fnv1.State, error) {
 	r, err := AsStruct(xr)
 	if err != nil {
 		return nil, errors.Wrap(err, errXRAsStruct)
 	}
 
-	oxr := &v1beta1.Resource{Resource: r, ConnectionDetails: xc}
+	oxr := &fnv1.Resource{Resource: r, ConnectionDetails: xc}
 
-	ocds := make(map[string]*v1beta1.Resource)
+	ocds := make(map[string]*fnv1.Resource)
 	for name, or := range rs {
 		r, err := AsStruct(or.Resource)
 		if err != nil {
 			return nil, errors.Wrapf(err, errFmtCDAsStruct, name)
 		}
 
-		ocds[string(name)] = &v1beta1.Resource{Resource: r, ConnectionDetails: or.ConnectionDetails}
+		ocds[string(name)] = &fnv1.Resource{Resource: r, ConnectionDetails: or.ConnectionDetails}
 	}
 
-	return &v1beta1.State{Composite: oxr, Resources: ocds}, nil
+	return &fnv1.State{Composite: oxr, Resources: ocds}, nil
 }
 
 // AsStruct converts the supplied object to a protocol buffer Struct well-known
@@ -828,9 +743,17 @@ func (d *DeletingComposedResourceGarbageCollector) GarbageCollectComposedResourc
 	}
 
 	for name, cd := range del {
-		// We want to garbage collect this resource, but we don't control it.
-		if c := metav1.GetControllerOf(cd.Resource); c == nil || c.UID != owner.GetUID() {
-			continue
+		// Don't garbage collect composed resources that someone else controls.
+		//
+		// We do garbage collect composed resources that no-one controls. If a
+		// composed resource appears in observed (i.e. appears in the XR's
+		// spec.resourceRefs) but doesn't have a controller ref, most likely we
+		// created it but its controller ref was stripped. In this situation it
+		// would be permissible for us to adopt the composed resource by setting
+		// our XR as the controller ref, then delete it. So we may as well just
+		// go straight to deleting it.
+		if c := metav1.GetControllerOf(cd.Resource); c != nil && c.UID != owner.GetUID() {
+			return errors.Errorf(errFmtControllerMismatch, name, c.Kind, c.Name)
 		}
 
 		if err := d.client.Delete(ctx, cd.Resource); resource.IgnoreNotFound(err) != nil {
@@ -939,4 +862,11 @@ func (u *PatchingManagedFieldsUpgrader) Upgrade(ctx context.Context, obj client.
 		]`, obj.GetResourceVersion()))
 		return errors.Wrap(resource.IgnoreNotFound(u.client.Patch(ctx, obj, client.RawPatch(types.JSONPatchType, p))), "cannot clear field managers")
 	}
+}
+
+func convertTarget(t fnv1.Target) CompositionTarget {
+	if t == fnv1.Target_TARGET_COMPOSITE_AND_CLAIM {
+		return CompositionTargetCompositeAndClaim
+	}
+	return CompositionTargetComposite
 }
